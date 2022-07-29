@@ -265,7 +265,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
+        torch.cuda.nvtx.range_push('reduce_from_tp')
         output = reduce_from_tensor_model_parallel_region(output_parallel)
+        torch.cuda.nvtx.range_pop()
         return output
 
 
@@ -302,7 +304,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 device=torch.cuda.current_device(),
                 requires_grad=False,
             )
-            torch.distributed._all_gather_base(all_gather_buffer, input, group=get_tensor_model_parallel_group())
+            torch.distributed.all_gather(
+                list(all_gather_buffer.chunk(world_size)),
+                input,
+                group=get_tensor_model_parallel_group(),
+            )
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -327,12 +333,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 device=torch.cuda.current_device(),
                 requires_grad=False,
             )
-            handle = torch.distributed._all_gather_base(
-                all_gather_buffer,
+            handle = torch.distributed.all_gather(
+                list(all_gather_buffer.chunk(get_tensor_model_parallel_world_size())),
                 input,
                 group=get_tensor_model_parallel_group(),
                 async_op=True,
             )
+
+            # Delay the start of input gradient computation shortly (3us) to have gather scheduled first and have GPU resources allocated
+            _ = torch.empty(1, device=grad_output.device) + 1
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -348,21 +357,35 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
+            torch.cuda.nvtx.range_push('async_all_reduce_from_tp')
             handle = torch.distributed.all_reduce(
                 grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
+            torch.cuda.nvtx.range_pop()
+
+            # Delay the start of weight gradient computation shortly (3us) to have
+            # all-reduce scheduled first and have GPU resources allocated
+            _ = torch.empty(1, device=grad_output.device) + 1
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
+            torch.cuda.nvtx.range_push('rs_from_tp')
+
             sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False)
-            handle = torch.distributed._reduce_scatter_base(
+            handle = torch.distributed.reduce_scatter(
                 sub_grad_input,
-                grad_input,
+                list(grad_input.chunk(get_tensor_model_parallel_world_size())),
                 group=get_tensor_model_parallel_group(),
-                async_op=True
+                async_op=True,
             )
+            torch.cuda.nvtx.range_pop()
+
+            # Delay the start of weight gradient computation shortly (3us) to have reduce scatter scheduled first and have GPU resources allocated
+            _ = torch.empty(1, device=grad_output.device) + 1
 
         if ctx.gradient_accumulation_fusion:
+            torch.cuda.nvtx.range_push('grad_accum_fusion')
+
             if not ctx.use_16bit_in_wgrad_accum_fusion:
                 fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
                     total_input, grad_output, weight.main_grad
@@ -372,15 +395,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     total_input, grad_output, weight.main_grad
                 )
             grad_weight = None
+            torch.cuda.nvtx.range_pop()
         else:
             grad_weight = grad_output.t().matmul(total_input)
 
         grad_bias = grad_output.sum(dim=0) if use_bias else None
+        torch.cuda.nvtx.range_push('tp_wait')
         if ctx.sequence_parallel_enabled:
             handle.wait()
             return sub_grad_input, grad_weight, grad_bias, None, None, None, None
         if ctx.async_grad_allreduce:
             handle.wait()
+        torch.cuda.nvtx.range_pop()
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
@@ -567,13 +593,13 @@ class ColumnParallelLinear(torch.nn.Module):
 
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
             raise RuntimeError("`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time.")
-
+        torch.cuda.nvtx.range_push("init_ar_tp")
         self._forward_impl = (
             linear_with_grad_accumulation_and_async_allreduce_in16bit
             if accumulation_in_fp16
             else linear_with_grad_accumulation_and_async_allreduce
         )
-
+        torch.cuda.nvtx.range_pop()
     def forward(self, input_: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 

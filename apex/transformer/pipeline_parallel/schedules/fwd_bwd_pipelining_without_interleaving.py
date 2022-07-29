@@ -326,15 +326,21 @@ def forward_backward_pipelining_without_interleaving(
     # Run warmup forward passes.
     ###################################################################################################################
     _logger.info("Warmup")
+    torch.cuda.nvtx.range_push("warmup")
     for i in range(num_warmup_microbatches):
         _logger.debug(f"warmup iter: {i} / {num_warmup_microbatches}")
         _logger.debug("receive fwd")
+
+        torch.cuda.nvtx.range_push("recv_fwd")
+
         input_tensor = recv_forward(
             tensor_shapes=recv_tensor_shapes,
             dtype=dtype,
             async_comm=async_comm,
             sequence_parallel_enabled=sequence_parallel_enabled,
         )
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("fwd_step")
         cur_microbatch: Optional[torch.Tensor] = get_kth_microbatch(batch, i)
         output_tensor = forward_step(
             forward_step_func,
@@ -346,6 +352,8 @@ def forward_backward_pipelining_without_interleaving(
             disable_autocast,
         )
         _logger.debug("send fwd")
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("send_fwd")
         send_forward(
             output_tensor,
             tensor_shapes=send_tensor_shapes,
@@ -353,11 +361,14 @@ def forward_backward_pipelining_without_interleaving(
             async_comm=async_comm,
             sequence_parallel_enabled=sequence_parallel_enabled,
         )
-
+        torch.cuda.nvtx.range_pop()
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             free_output_tensor(output_tensor, deallocate_pipeline_outputs)
+        torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("1f1b")
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -375,6 +386,7 @@ def forward_backward_pipelining_without_interleaving(
         last_iteration: bool = i == (num_microbatches_remaining - 1)
 
         cur_microbatch: Optional[torch.Tensor] = get_kth_microbatch(batch, i + num_warmup_microbatches)
+        torch.cuda.nvtx.range_push("fwd_step")
         output_tensor: Union[torch.Tensor, Sequence[torch.Tensor]] = forward_step(
             forward_step_func,
             cur_microbatch,
@@ -386,6 +398,7 @@ def forward_backward_pipelining_without_interleaving(
         )
         if forward_only:
             _logger.debug("send fwd")
+            torch.cuda.nvtx.range_push("send_fwd")
             send_forward(
                 output_tensor,
                 tensor_shapes=send_tensor_shapes,
@@ -393,7 +406,6 @@ def forward_backward_pipelining_without_interleaving(
                 async_comm=async_comm,
                 sequence_parallel_enabled=sequence_parallel_enabled,
             )
-
             if not last_iteration:
                 _logger.debug("receive fwd (last iteration)")
                 input_tensor = recv_forward(
@@ -402,9 +414,10 @@ def forward_backward_pipelining_without_interleaving(
                     async_comm=async_comm,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                 )
-
+            torch.cuda.nvtx.range_pop()
         else:
             _logger.debug("send fwd & receive bwd")
+            torch.cuda.nvtx.range_push("send_fwd")
             output_tensor_grad = send_forward_recv_backward(
                 output_tensor,
                 tensor_shapes=send_tensor_shapes,
@@ -412,7 +425,7 @@ def forward_backward_pipelining_without_interleaving(
                 async_comm=async_comm,
                 sequence_parallel_enabled=sequence_parallel_enabled,
             )
-
+            torch.cuda.nvtx.range_pop()
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
@@ -421,7 +434,7 @@ def forward_backward_pipelining_without_interleaving(
             # Pop input_tensor and output_tensor from the start of the list for the backward pass.
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
-
+            torch.cuda.nvtx.range_push("bwd_step")
             input_tensor_grad = backward_step(
                 input_tensor,
                 output_tensor,
@@ -430,7 +443,8 @@ def forward_backward_pipelining_without_interleaving(
                 grad_scaler=grad_scaler,
                 deallocate_pipeline_outputs=deallocate_pipeline_outputs,
             )
-
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("send_bwd")
             if last_iteration:
                 input_tensor = None
                 _logger.debug("send bwd")
@@ -441,8 +455,10 @@ def forward_backward_pipelining_without_interleaving(
                     async_comm=async_comm,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                 )
+                torch.cuda.nvtx.range_pop()
             else:
                 _logger.debug("send bwd and receive fwd")
+                torch.cuda.nvtx.range_push("send_bwd_rcv_fwd")
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad,
                     tensor_shapes=recv_tensor_shapes,
@@ -450,6 +466,10 @@ def forward_backward_pipelining_without_interleaving(
                     async_comm=async_comm,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                 )
+                torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("cooldown")
+
     ###################################################################################################################
     # Run cooldown backward passes.
     ###################################################################################################################
@@ -485,5 +505,6 @@ def forward_backward_pipelining_without_interleaving(
                 async_comm=async_comm,
                 sequence_parallel_enabled=sequence_parallel_enabled,
             )
+    torch.cuda.nvtx.range_pop()
 
     return losses_reduced

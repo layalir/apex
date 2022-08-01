@@ -366,7 +366,6 @@ def forward_backward_pipelining_without_interleaving(
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             free_output_tensor(output_tensor, deallocate_pipeline_outputs)
-        torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("1f1b")
 
@@ -396,6 +395,7 @@ def forward_backward_pipelining_without_interleaving(
             dtype,
             disable_autocast,
         )
+        torch.cuda.nvtx.range_pop()
         if forward_only:
             _logger.debug("send fwd")
             torch.cuda.nvtx.range_push("send_fwd")
@@ -417,7 +417,7 @@ def forward_backward_pipelining_without_interleaving(
             torch.cuda.nvtx.range_pop()
         else:
             _logger.debug("send fwd & receive bwd")
-            torch.cuda.nvtx.range_push("send_fwd")
+            torch.cuda.nvtx.range_push("send_fwd_recv_bwd")
             output_tensor_grad = send_forward_recv_backward(
                 output_tensor,
                 tensor_shapes=send_tensor_shapes,
@@ -444,10 +444,11 @@ def forward_backward_pipelining_without_interleaving(
                 deallocate_pipeline_outputs=deallocate_pipeline_outputs,
             )
             torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_push("send_bwd")
             if last_iteration:
                 input_tensor = None
                 _logger.debug("send bwd")
+                torch.cuda.nvtx.range_push("send_bwd")
+
                 send_backward(
                     input_tensor_grad,
                     tensor_shapes=recv_tensor_shapes,

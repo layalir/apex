@@ -406,15 +406,19 @@ def forward_backward_pipelining_without_interleaving(
                 async_comm=async_comm,
                 sequence_parallel_enabled=sequence_parallel_enabled,
             )
+            torch.cuda.nvtx.range_pop()
+
             if not last_iteration:
                 _logger.debug("receive fwd (last iteration)")
+                torch.cuda.nvtx.range_push("recv_fwd")
                 input_tensor = recv_forward(
                     tensor_shapes=recv_tensor_shapes,
                     dtype=dtype,
                     async_comm=async_comm,
                     sequence_parallel_enabled=sequence_parallel_enabled,
                 )
-            torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_pop()
+
         else:
             _logger.debug("send fwd & receive bwd")
             torch.cuda.nvtx.range_push("send_fwd_recv_bwd")
